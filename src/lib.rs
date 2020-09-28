@@ -43,6 +43,8 @@ mod fs {
 struct TextData {
     glyphs: Vec<PositionedGlyph<'static>>,
     color:  [f32; 4],
+    background_color:  [f32; 4],
+    bounding_rect: Rect<i32>,
 }
 
 pub struct DrawText {
@@ -54,6 +56,7 @@ pub struct DrawText {
     pipeline:           Arc<GraphicsPipeline<SingleBufferDefinition<Vertex>, Box<dyn PipelineLayoutAbstract + Send + Sync>, Arc<dyn RenderPassAbstract + Send + Sync>>>,
     framebuffers:       Vec<Arc<dyn FramebufferAbstract + Send + Sync>>,
     texts:              Vec<TextData>,
+    block_glyph:        PositionedGlyph<'static>,
 }
 
 const CACHE_WIDTH: usize = 1000;
@@ -67,8 +70,11 @@ impl DrawText {
         let vs = vs::Shader::load(device.clone()).unwrap();
         let fs = fs::Shader::load(device.clone()).unwrap();
 
-        let cache = Cache::builder().dimensions(CACHE_WIDTH as u32, CACHE_HEIGHT as u32).build();
+        let mut cache = Cache::builder().dimensions(CACHE_WIDTH as u32, CACHE_HEIGHT as u32).build();
         let cache_pixel_buffer = vec!(0; CACHE_WIDTH * CACHE_HEIGHT);
+
+        let block_glyph = font.glyph('█').scaled(Scale::uniform(20.0)).positioned(point(0.0, 0.0)).standalone();
+        cache.queue_glyph(0, block_glyph.clone());
 
         let render_pass = Arc::new(vulkano::single_pass_renderpass!(device.clone(),
             attachments: {
@@ -121,17 +127,31 @@ impl DrawText {
             pipeline,
             framebuffers,
             texts: vec!(),
+            block_glyph,
         }
     }
 
-    pub fn queue_text(&mut self, x: f32, y: f32, size: f32, color: [f32; 4], text: &str) {
+    pub fn queue_text(&mut self, x: f32, y: f32, size: f32, color: [f32; 4], background_color: [f32; 4], text: &str) {
         let glyphs: Vec<PositionedGlyph> = self.font.layout(text, Scale::uniform(size), point(x, y)).map(|x| x.standalone()).collect();
+        let mut bounding_rect = Rect {
+            min: point(x as i32, y as i32),
+            max: point(x as i32, y as i32),
+        };
         for glyph in &glyphs {
             self.cache.queue_glyph(0, glyph.clone());
+            if let Some(r) = glyph.pixel_bounding_box() {
+                update_bounding_rect(&mut bounding_rect, &r);
+            }
         }
+        bounding_rect.min.x -= 1;
+        bounding_rect.min.y -= 1;
+        bounding_rect.max.x += 1;
+        bounding_rect.max.y += 1;
         self.texts.push(TextData {
             glyphs: glyphs.clone(),
             color:  color,
+            background_color: background_color,
+            bounding_rect: bounding_rect,
         });
     }
 
@@ -207,7 +227,54 @@ impl DrawText {
 
         // draw
         for text in &mut self.texts.drain(..) {
-            let vertices: Vec<Vertex> = text.glyphs.iter().flat_map(|g| {
+            let mut vertices = if let Ok(Some((uv_rect, _))) = cache.rect_for(0, &self.block_glyph) {
+                let gl_rect = Rect {
+                    min: point(
+                        (text.bounding_rect.min.x as f32 / screen_width  as f32 - 0.5) * 2.0,
+                        (text.bounding_rect.min.y as f32 / screen_height as f32 - 0.5) * 2.0
+                    ),
+                    max: point(
+                       (text.bounding_rect.max.x as f32 / screen_width  as f32 - 0.5) * 2.0,
+                       (text.bounding_rect.max.y as f32 / screen_height as f32 - 0.5) * 2.0
+                    )
+                };
+                vec!(
+                    Vertex {
+                        position:     [gl_rect.min.x, gl_rect.max.y],
+                        tex_position: [uv_rect.min.x, uv_rect.max.y],
+                        color:        text.background_color,
+                    },
+                    Vertex {
+                        position:     [gl_rect.min.x, gl_rect.min.y],
+                        tex_position: [uv_rect.min.x, uv_rect.min.y],
+                        color:        text.background_color,
+                    },
+                    Vertex {
+                        position:     [gl_rect.max.x, gl_rect.min.y],
+                        tex_position: [uv_rect.max.x, uv_rect.min.y],
+                        color:        text.background_color,
+                    },
+
+                    Vertex {
+                        position:     [gl_rect.max.x, gl_rect.min.y],
+                        tex_position: [uv_rect.max.x, uv_rect.min.y],
+                        color:        text.background_color,
+                    },
+                    Vertex {
+                        position:     [gl_rect.max.x, gl_rect.max.y],
+                        tex_position: [uv_rect.max.x, uv_rect.max.y],
+                        color:        text.background_color,
+                    },
+                    Vertex {
+                        position:     [gl_rect.min.x, gl_rect.max.y],
+                        tex_position: [uv_rect.min.x, uv_rect.max.y],
+                        color:        text.background_color,
+                    },
+                )
+            } else {
+                vec!()
+            };
+            vertices.extend(text.glyphs.iter().flat_map(|g| {
                 if let Ok(Some((uv_rect, screen_rect))) = cache.rect_for(0, g) {
                     let gl_rect = Rect {
                         min: point(
@@ -256,7 +323,7 @@ impl DrawText {
                 else {
                     vec!().into_iter()
                 }
-            }).collect();
+            }));
 
             let vertex_buffer = CpuAccessibleBuffer::from_iter(self.device.clone(), BufferUsage::all(), false, vertices.into_iter()).unwrap();
             command_buffer = command_buffer.draw(self.pipeline.clone(), &DynamicState::none(), vertex_buffer.clone(), set.clone(), ()).unwrap();
@@ -274,4 +341,19 @@ impl DrawTextTrait for AutoCommandBufferBuilder {
 
 pub trait DrawTextTrait {
     fn draw_text(&mut self, data: &mut DrawText, image_num: usize) -> &mut Self;
+}
+
+fn update_bounding_rect(bounding_rect: &mut Rect<i32>, glyph_rect: &Rect<i32>) {
+    if bounding_rect.min.x > glyph_rect.min.x {
+        bounding_rect.min.x = glyph_rect.min.x;
+    }
+    if bounding_rect.min.y > glyph_rect.min.y {
+        bounding_rect.min.y = glyph_rect.min.y;
+    }
+    if bounding_rect.max.x < glyph_rect.max.x {
+        bounding_rect.max.x = glyph_rect.max.x;
+    }
+    if bounding_rect.max.y < glyph_rect.max.y {
+        bounding_rect.max.y = glyph_rect.max.y;
+    }
 }
