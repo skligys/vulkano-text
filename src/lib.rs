@@ -326,7 +326,7 @@ impl DrawText {
             }));
 
             let vertex_buffer = CpuAccessibleBuffer::from_iter(self.device.clone(), BufferUsage::all(), false, vertices.into_iter()).unwrap();
-            command_buffer = command_buffer.draw(self.pipeline.clone(), &DynamicState::none(), vertex_buffer.clone(), set.clone(), ()).unwrap();
+            command_buffer = command_buffer.draw(self.pipeline.clone(), &DynamicState::none(), vertex_buffer.clone(), set.clone(), (), vec![]).unwrap();
         }
 
         command_buffer.end_render_pass().unwrap()
